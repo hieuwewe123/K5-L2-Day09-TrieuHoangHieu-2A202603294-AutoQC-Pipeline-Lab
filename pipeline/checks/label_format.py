@@ -21,9 +21,132 @@ Gợi ý
 - `iou_xywh(a, b)` có sẵn trong common.py.
 - Ngưỡng nằm trong `cfg["label_format"]` — đừng viết cứng số vào code.
 """
-from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
+from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line
 
 
 def run(ds, cfg):
-    # TODO: duyệt từng file nhãn, từng dòng
-    raise NotImplementedError("check label_format chưa làm")
+    issues = []
+    lf_cfg = cfg.get("label_format", {})
+    overflow_tol = lf_cfg.get("overflow_tol", 0.002)
+    dup_box_iou = lf_cfg.get("dup_box_iou", 0.9)
+    min_box_px = lf_cfg.get("min_box_px", 12)
+    max_box_frac = lf_cfg.get("max_box_frac", 0.95)
+
+    for p in ds.image_files():
+        stem = p.stem
+        lines = ds.read_label_lines(stem)
+        if lines is None:
+            continue
+
+        size = ds.image_size(stem)
+        valid_boxes_seen = []
+
+        for line_num, text in lines:
+            try:
+                c, cx, cy, w, h = parse_yolo_line(text)
+            except ValueError:
+                issues.append(
+                    Issue(
+                        check="label_format",
+                        severity=ERROR,
+                        code="BAD_FORMAT",
+                        image=stem,
+                        line=line_num,
+                        message=f"dòng sai định dạng: {text}",
+                    )
+                )
+                continue
+
+            if not (0 <= c < len(ds.classes)):
+                issues.append(
+                    Issue(
+                        check="label_format",
+                        severity=ERROR,
+                        code="BAD_CLASS_ID",
+                        image=stem,
+                        line=line_num,
+                        message=f"id lớp lạ {c}",
+                    )
+                )
+                continue
+
+            if w <= 0 or h <= 0:
+                issues.append(
+                    Issue(
+                        check="label_format",
+                        severity=ERROR,
+                        code="BOX_ZERO",
+                        image=stem,
+                        line=line_num,
+                        message=f"box rộng/cao <= 0 ({w}, {h})",
+                    )
+                )
+                continue
+
+            # Kiểm tra tràn ảnh
+            left = cx - w / 2.0
+            right = cx + w / 2.0
+            top = cy - h / 2.0
+            bottom = cy + h / 2.0
+            overflow = max(0.0, -left, -top, right - 1.0, bottom - 1.0)
+            if overflow > overflow_tol:
+                issues.append(
+                    Issue(
+                        check="label_format",
+                        severity=ERROR,
+                        code="BOX_OUT_OF_IMAGE",
+                        image=stem,
+                        line=line_num,
+                        message=f"box tràn ảnh (mức tràn {overflow:.4f})",
+                        extra={"overflow": overflow},
+                    )
+                )
+
+            # Kiểm tra box lặp
+            curr_box = (cx, cy, w, h)
+            for prev_line, prev_c, prev_box in valid_boxes_seen:
+                if prev_c == c and iou_xywh(curr_box, prev_box) > dup_box_iou:
+                    issues.append(
+                        Issue(
+                            check="label_format",
+                            severity=ERROR,
+                            code="DUP_BOX",
+                            image=stem,
+                            line=line_num,
+                            message=f"trùng box với dòng {prev_line}",
+                        )
+                    )
+                    break
+            valid_boxes_seen.append((line_num, c, curr_box))
+
+            # Cảnh báo box quá nhỏ (WARN)
+            if size is not None:
+                img_w, img_h = size
+                short_side = min(w * img_w, h * img_h)
+                if short_side < min_box_px:
+                    issues.append(
+                        Issue(
+                            check="label_format",
+                            severity=WARN,
+                            code="BOX_TINY",
+                            image=stem,
+                            line=line_num,
+                            message=f"box quá nhỏ ({short_side:.1f}px < {min_box_px}px)",
+                            extra={"min_side_px": short_side},
+                        )
+                    )
+
+            # Cảnh báo box quá to (WARN)
+            if w * h > max_box_frac:
+                issues.append(
+                    Issue(
+                        check="label_format",
+                        severity=WARN,
+                        code="BOX_HUGE",
+                        image=stem,
+                        line=line_num,
+                        message=f"box chiếm {w*h:.2f} > {max_box_frac} ảnh",
+                    )
+                )
+
+    return issues
