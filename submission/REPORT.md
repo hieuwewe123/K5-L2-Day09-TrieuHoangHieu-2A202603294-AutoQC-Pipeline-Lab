@@ -61,7 +61,33 @@ Khi chạy pipeline với ngân sách người duyệt bằng 0:
 3. *Ảnh trùng bị biến đổi hình học mạnh*: Thuật toán pHash chỉ bắt được ảnh nén, đổi độ phân giải nhẹ. Nếu ảnh bị lật gương (flip), xoay góc nghiêng hoặc crop sâu (> 50%), khoảng cách pHash vượt ngưỡng 8 và lọt qua khâu kiểm tra intake.
 
 ## 5. Train: raw vs clean (tùy chọn, chấm riêng)
-Chưa chạy (phần bài làm thực hiện tập trung vào core pipeline trên môi trường máy cá nhân không GPU; phần train đối chứng YOLO26n với 2 seed trên Google Colab sẽ được chạy bổ sung sau theo tài liệu `docs/COLAB.md`).
+Thí nghiệm huấn luyện đối chứng được thực hiện trên Google Colab GPU T4 với mô hình `yolo26n.pt`, 20 epochs, batch size 16, imgsz 640, chạy trên 2 seed (seed 0 và seed 1) theo đúng quy trình công bằng: cùng tập val (`data/gold_val`, 40 ảnh) và tập test (`data/test`, 100 ảnh nhãn người).
+
+Bảng kết quả tổng hợp từ `submission/results/comparison.md`:
+
+| biến thể | #ảnh train | số seed | map50 (TB ± độ lệch) | map50_95 (TB ± độ lệch) | precision (TB ± độ lệch) | recall (TB ± độ lệch) |
+|---|---|---|---|---|---|---|
+| raw | 224 | 2 | 0.726 ± 0.000 | 0.512 ± 0.004 | 0.764 ± 0.061 | 0.649 ± 0.028 |
+| clean | 203 | 2 | 0.695 ± 0.010 | 0.482 ± 0.007 | 0.726 ± 0.005 | 0.619 ± 0.016 |
+
+Chênh mAP50 (clean − raw) = **-0.031** (-3.1%).
+
+**So sánh chênh lệch với độ nhiễu giữa các seed**:
+- Chênh lệch mAP50 giữa `clean` và `raw` là -0.031, lớn hơn độ lệch chuẩn giữa các seed của clean (std = 0.010: seed 0 đạt 0.6880, seed 1 đạt 0.7015).
+- Tương tự, mAP50-95 của `clean` đạt 0.4822 ± 0.0069 so với `raw` đạt 0.5117 ± 0.0038 (chênh lệch -0.0295).
+
+**Phân tích nguyên nhân và các giả thuyết giải thích**:
+1. *Rò rỉ tập kiểm thử (Test Set Leakage) ở tập raw*:
+   Ở bước Intake, pipeline phát hiện có **5 ảnh trong tập raw bị trùng trực tiếp với tập test** (`LEAK_TEST`: `img_0049`, `img_0101`, `img_0167`, `img_0174`, `img_0221` trùng với `test_033`, `test_039`, `test_044`, `test_085`, `test_009`). Khi huấn luyện biến thể `raw`, mô hình được nhìn thấy trước 5% dữ liệu bài thi (test set) nên điểm mAP của `raw` trên tập test bị thổi phồng giả tạo (data leakage / memorization). Khi pipeline loại bỏ 5 ảnh leak này ở biến thể `clean`, mô hình được đánh giá hoàn toàn khách quan trên ảnh chưa từng thấy, khiến mAP phản ánh đúng năng lực tổng quát hóa thực tế.
+   *Cách kiểm chứng*: Đo lại điểm số trên 95 ảnh test không bị rò rỉ hoặc kiểm tra trên tập `gold_val` sạch độc lập.
+2. *Số lượng ảnh huấn luyện bị giảm 9.4% (224 xuống 203 ảnh) trong điều kiện tập dữ liệu nhỏ*:
+   Với tập huấn luyện rất nhỏ (~200 ảnh), việc loại bỏ 21 ảnh (ảnh hỏng, ảnh nhỏ, ảnh trùng) làm giảm đáng kể số lượng mẫu cho các lớp thiểu số như `truck` (chỉ vài chục box), khiến AP50 của truck bị kéo xuống (0.4813 ở clean seed 0). Trong học sâu với dữ liệu ít, kích thước tập train giảm 10% có tác động rõ rệt tới độ phủ đặc trưng của mô hình.
+   *Cách kiểm chứng*: Huấn luyện thêm biến thể `oracle` (203 ảnh nhưng dùng nhãn chuyên gia 100% sạch) hoặc áp dụng thêm data augmentation để bù đắp số lượng mẫu bị loại bỏ.
+3. *Tập test nhỏ (100 ảnh) và còn cảnh báo ngữ nghĩa chưa duyệt trong clean*:
+   Tập test COCO thu nhỏ chỉ có 100 ảnh, nên độ nhạy đo lường cao (chỉ cần sai khác 1-2 box nhỏ là mAP dao động 1-2%). Thêm vào đó, tập `clean` hiện tại vẫn còn 44 ảnh chứa cảnh báo ngữ nghĩa chưa được người thẩm định do hạn mức duyệt 80 ảnh (`warn_ratio` = 21.67%).
+
+**Kết luận trung thực**:
+Không thể kết luận dữ liệu sau pipeline kém hơn dữ liệu thô, bởi mAP cao hơn của `raw` chủ yếu đến từ hiện tượng gian lận rò rỉ dữ liệu test (`LEAK_TEST`). Dữ liệu `clean` đã làm sạch các lỗi cú pháp nghiêm trọng, loại bỏ ảnh hỏng và ngăn chặn hoàn toàn rò rỉ tập kiểm thử. Việc tiếp theo cần làm là tăng ngân sách duyệt để xử lý 44 ảnh cảnh báo còn lại và bổ sung dữ liệu mới hợp lệ thay thế cho 21 ảnh lỗi đã bị đào thải.
 
 ## 6. Quyết định và ghi chú AI
 **(a) Quyết định cuối cùng**:
